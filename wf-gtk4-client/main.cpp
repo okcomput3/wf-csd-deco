@@ -26,15 +26,6 @@ static void on_button_released(GtkGestureClick *gesture,
 
 static gboolean on_close_request(GtkWindow *window, gpointer data)
 {
-    auto wdata = (window_data*)data;
-
-    close_request(wdata->wf_id);
-
-    return true;
-}
-
-static gboolean close_window(GtkWindow *window, gpointer data)
-{
     GtkWidget *win = (GtkWidget*)data;
     auto it = std::find_if(view_to_decor.begin(), view_to_decor.end(),
         [&win] (const std::pair<uint32_t, GtkWidget*>& element)
@@ -53,6 +44,17 @@ static gboolean close_window(GtkWindow *window, gpointer data)
     win_data.erase(win);
 
     return false;
+}
+
+/* User clicked the decoration's titlebar close button. Ask the compositor to
+ * close the underlying view; it then tears the decoration down via the
+ * destroy_decoration event (which runs the cleanup above). Return TRUE so GTK
+ * doesn't also destroy our decoration window out from under that flow. */
+static gboolean on_deco_close_request(GtkWindow*, gpointer data)
+{
+    auto wdata = (window_data*)data;
+    close_request(wdata->wf_id);
+    return TRUE;
 }
 
 static void on_area_resized(GtkDrawingArea*, int w, int h, gpointer data)
@@ -80,58 +82,259 @@ static void on_area_resized(GtkDrawingArea*, int w, int h, gpointer data)
     }
 }
 
-// --- Drag Source Setup ---
-static GdkContentProvider *drag_prepare_cb(GtkDragSource *source,
+// --- Compositor-side drag-to-group (dispatched at the window level) ---
+// GTK's header-bar window-move is triggered high in the widget tree, before a
+// gesture on a tab button can resolve, so a per-button gesture loses the race
+// and the whole window slides under the cursor while the group-drag also runs.
+// Instead, a single GtkGestureDrag on the *window* in the CAPTURE phase (which
+// runs before the header) inspects the widget under the press: if it's one we
+// marked draggable (a tab or the app icon), we claim the sequence up front —
+// which blocks the window-move — and drive the group-drag; otherwise we stay
+// out of the way so the titlebar still moves the window normally.
+
+/* Tag a widget as a drag handle for a group member and remember whether a
+ * no-move tap on it should select (morph to) that member. No per-widget gesture
+ * is attached; the window-level gesture below reads these tags. */
+static void mark_group_draggable(GtkWidget *widget, window_data *wdata, gboolean tap_selects)
+{
+    g_object_set_data(G_OBJECT(widget), "wf-draggable", GINT_TO_POINTER(1));
+    g_object_set_data(G_OBJECT(widget), "wf-member-id", GUINT_TO_POINTER(wdata->wf_id));
+    g_object_set_data(G_OBJECT(widget), "wf-tap-selects", GINT_TO_POINTER(tap_selects ? 1 : 0));
+    gtk_widget_set_can_target(widget, TRUE);
+}
+
+static void win_drag_begin(GtkGestureDrag *gesture,
     double x,
     double y,
     gpointer user_data)
 {
-    g_print("Drag prepare.\n");
-    auto data = (window_data*)user_data;
-    // Initialize the GValue with a string and set it
-    GValue value = G_VALUE_INIT;
-    g_value_init(&value, G_TYPE_INT);
-    g_value_set_int(&value, data->wf_id);
-    auto content_provider = gdk_content_provider_new_for_value(&value);
-    gtk_gesture_set_state(GTK_GESTURE(source), GTK_EVENT_SEQUENCE_CLAIMED);
-    return content_provider;
+    GtkWidget *window = (GtkWidget*)user_data;
+
+    g_object_set_data(G_OBJECT(gesture), "wf-armed", GINT_TO_POINTER(0));
+    g_object_set_data(G_OBJECT(gesture), "wf-drag-sent", GINT_TO_POINTER(0));
+
+    /* Which widget is under the press? Walk up to a marked drag handle. */
+    GtkWidget *picked = gtk_widget_pick(window, x, y, GTK_PICK_DEFAULT);
+    guint id = 0;
+    int tap_sel = 0;
+    gboolean found = FALSE;
+    for (GtkWidget *w = picked; w != NULL; w = gtk_widget_get_parent(w))
+    {
+        if (g_object_get_data(G_OBJECT(w), "wf-draggable"))
+        {
+            id      = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(w), "wf-member-id"));
+            tap_sel = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "wf-tap-selects"));
+            found   = TRUE;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        /* Empty titlebar or window content: let GTK move the window as usual. */
+        return;
+    }
+
+    g_object_set_data(G_OBJECT(gesture), "wf-armed", GINT_TO_POINTER(1));
+    g_object_set_data(G_OBJECT(gesture), "wf-id", GUINT_TO_POINTER(id));
+    g_object_set_data(G_OBJECT(gesture), "wf-tap-selects", GINT_TO_POINTER(tap_sel));
+    /* Own the sequence before the header's move gesture can: this is what stops
+     * the whole window from being dragged. */
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
-static void drag_begin_cb(GtkDragSource *source,
-    GdkDrag *drag,
+static void win_drag_update(GtkGestureDrag *gesture,
+    double dx,
+    double dy,
     gpointer user_data)
 {
-    g_print("Drag begin.\n");
-    auto data = (window_data*)user_data;
-    GtkDragIcon *drag_icon = GTK_DRAG_ICON(gtk_drag_icon_get_for_drag(drag));
-    GtkWidget *image = gtk_image_new_from_icon_name(data->app_id.c_str());
-    gtk_image_set_pixel_size(GTK_IMAGE(image), 48);
-    gtk_drag_icon_set_child(drag_icon, image);
+    if (!GPOINTER_TO_INT(g_object_get_data(G_OBJECT(gesture), "wf-armed")))
+    {
+        return;
+    }
+
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(gesture), "wf-drag-sent")))
+    {
+        return;
+    }
+
+    if ((dx * dx + dy * dy) < 8.0 * 8.0)
+    {
+        return;
+    }
+
+    guint id = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(gesture), "wf-id"));
+    g_object_set_data(G_OBJECT(gesture), "wf-drag-sent", GINT_TO_POINTER(1));
+    start_group_drag(id);
 }
 
-static void drag_end_cb(GtkDragSource *source,
-    GdkDrag *drag,
-    gboolean delete_data,
+static void win_drag_end(GtkGestureDrag *gesture,
+    double dx,
+    double dy,
     gpointer user_data)
 {
-    g_print("Drag operation completed.\n");
+    if (!GPOINTER_TO_INT(g_object_get_data(G_OBJECT(gesture), "wf-armed")))
+    {
+        return;
+    }
+
+    int was_drag = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(gesture), "wf-drag-sent"));
+    guint id     = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(gesture), "wf-id"));
+    int tap_sel  = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(gesture), "wf-tap-selects"));
+
+    if (was_drag)
+    {
+        /* Real drag already ran; the compositor handles the release. */
+        return;
+    }
+
+    if (tap_sel)
+    {
+        /* No-move tap on a tab -> select that member (drives the morph). */
+        select_window(id);
+    }
 }
 
-static void on_button_pressed(GtkGestureClick *gesture,
-    int n_press,
-    double x,
-    double y,
-    gpointer user_data)
+/* One capture-phase drag gesture per decoration window, dispatching to whichever
+ * tab/icon the press started on. */
+static void attach_window_group_drag(GtkWidget *window)
 {
-    auto wdata = (window_data*)user_data;
-
-    select_window(wdata->wf_id);
+    GtkGesture *drag = gtk_gesture_drag_new();
+    /* Left button only, so the middle-click ungroup gesture is unaffected. */
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(drag), GDK_BUTTON_PRIMARY);
+    g_signal_connect(drag, "drag-begin", G_CALLBACK(win_drag_begin), window);
+    g_signal_connect(drag, "drag-update", G_CALLBACK(win_drag_update), window);
+    g_signal_connect(drag, "drag-end", G_CALLBACK(win_drag_end), window);
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(drag), GTK_PHASE_CAPTURE);
+    gtk_widget_add_controller(window, GTK_EVENT_CONTROLLER(drag));
 }
 
 static void add_tab_button(window_data *wdata, window_data *cdata);
 static void clear_group_tabs(uint32_t group_id);
 static void reparent_group(uint32_t group_id, window_data *last_parent);
 static void refresh_group(uint32_t group_id);
+static void clear_box(GtkWidget *box);
+static std::shared_ptr<window_data> lookup_wdata(uint32_t id);
+
+/* Rebuild the tab strips for a group (and give a just-ungrouped window its
+ * solo icon) on the next main-loop iteration. Doing this synchronously from
+ * inside a gesture "released" handler destroys the very widgets GTK is still
+ * dispatching on, which corrupts input state and makes the icons go dead. */
+struct ungroup_rebuild_ctx
+{
+    uint32_t group_id;
+    uint32_t solo_id;
+};
+
+static gboolean ungroup_rebuild_idle(gpointer data)
+{
+    auto *ctx = (ungroup_rebuild_ctx*)data;
+
+    clear_group_tabs(ctx->group_id);
+
+    auto solo = lookup_wdata(ctx->solo_id);
+    if (solo)
+    {
+        clear_box(solo->tab_box);
+        add_tab_button(solo.get(), solo.get());
+    }
+
+    refresh_group(ctx->group_id);
+
+    delete ctx;
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean group_rebuild_idle(gpointer data)
+{
+    uint32_t group_id = GPOINTER_TO_UINT(data);
+    clear_group_tabs(group_id);
+    refresh_group(group_id);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_button_released(GtkGestureClick *gesture,
+    int n_press,
+    double x,
+    double y,
+    gpointer user_data)
+{
+    auto wdata    = (window_data*)user_data;
+    auto group_id = wdata->group.id;
+
+    if (!group_id)
+    {
+        return;
+    }
+
+    /* Update the data model now, but defer widget destruction/creation to an
+     * idle callback so we are not tearing down tab buttons while GTK is still
+     * inside this gesture's dispatch. */
+    for (auto cdata : win_data)
+    {
+        if (group_id == cdata.second->group.id)
+        {
+            if (cdata.second->group.parent)
+            {
+                cdata.second->group.order.erase(std::remove(cdata.second->group.order.begin(),
+                    cdata.second->group.order.end(), wdata->wf_id), cdata.second->group.order.end());
+                if (wdata->wf_id == cdata.second->wf_id)
+                {
+                    reparent_group(group_id, wdata);
+                }
+
+                break;
+            }
+        }
+    }
+
+    wdata->group.id = 0;
+
+    ungroup_window(wdata->wf_id);
+
+    auto *ctx = new ungroup_rebuild_ctx{group_id, wdata->wf_id};
+    g_idle_add(ungroup_rebuild_idle, ctx);
+}
+
+static void add_tab_button(window_data *wdata, window_data *cdata)
+{
+    GtkWidget *button = gtk_button_new_from_icon_name(cdata->app_id.c_str());
+
+    /* Every tab is draggable. Dragging a tab drags the member it represents
+     * (cdata): onto another window to (re)group it, or onto empty space to
+     * pull it back out of the group. For a solo window's own button
+     * cdata == wdata, so this matches the previous behaviour. A no-move tap
+     * selects that member (tap_selects = TRUE), driving the compositor morph. */
+    mark_group_draggable(button, cdata, TRUE);
+
+    GtkGesture *click_gesture = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture), 2);
+    g_signal_connect(click_gesture, "released", G_CALLBACK(on_button_released), cdata);
+    gtk_widget_add_controller(button, GTK_EVENT_CONTROLLER(click_gesture));
+
+    gtk_box_append(GTK_BOX(wdata->tab_box), button);
+}
+
+/* Safe lookup: window_data for a wf id, or nullptr if the id is not
+ * currently tracked. Avoids std::map::operator[] silently default-
+ * inserting a null entry (and the crash that follows when it is
+ * dereferenced) for stale ids left in a group's order list. */
+static std::shared_ptr<window_data> lookup_wdata(uint32_t id)
+{
+    auto dit = view_to_decor.find(id);
+    if (dit == view_to_decor.end())
+    {
+        return nullptr;
+    }
+
+    auto wit = win_data.find(dit->second);
+    if (wit == win_data.end())
+    {
+        return nullptr;
+    }
+
+    return wit->second;
+}
 
 int get_box_children_count(GtkWidget *box)
 {
@@ -156,72 +359,6 @@ static void clear_box(GtkWidget *box)
     }
 }
 
-static void on_button_released(GtkGestureClick *gesture,
-    int n_press,
-    double x,
-    double y,
-    gpointer user_data)
-{
-    auto wdata    = (window_data*)user_data;
-    auto group_id = wdata->group.id;
-
-    clear_group_tabs(group_id);
-
-    for (auto cdata : win_data)
-    {
-        if (group_id == cdata.second->group.id)
-        {
-            if (cdata.second->group.parent)
-            {
-                cdata.second->group.order.erase(std::remove(cdata.second->group.order.begin(),
-                    cdata.second->group.order.end(), wdata->wf_id), cdata.second->group.order.end());
-                if (wdata->wf_id == cdata.second->wf_id)
-                {
-                    reparent_group(group_id, wdata);
-                }
-
-                break;
-            }
-        }
-    }
-
-    wdata->group.id = 0;
-
-    if (group_id)
-    {
-        add_tab_button(wdata, wdata);
-    }
-
-    refresh_group(group_id);
-    ungroup_window(wdata->wf_id);
-}
-
-static void add_tab_button(window_data *wdata, window_data *cdata)
-{
-    GtkWidget *button = gtk_button_new_from_icon_name(cdata->app_id.c_str());
-
-    if (!cdata->group.id)
-    {
-        GtkDragSource *drag_source = gtk_drag_source_new();
-        gtk_drag_source_set_actions(drag_source, GdkDragAction(GDK_ACTION_COPY | GDK_ACTION_MOVE));
-        g_signal_connect(drag_source, "prepare", G_CALLBACK(drag_prepare_cb), wdata);
-        g_signal_connect(drag_source, "drag-begin", G_CALLBACK(drag_begin_cb), wdata);
-        g_signal_connect(drag_source, "drag-end", G_CALLBACK(drag_end_cb), NULL);
-        gtk_widget_add_controller(button, GTK_EVENT_CONTROLLER(drag_source));
-    }
-
-    GtkGesture *click_gesture = gtk_gesture_click_new();
-    g_signal_connect(click_gesture, "pressed", G_CALLBACK(on_button_pressed), cdata);
-    gtk_widget_add_controller(button, GTK_EVENT_CONTROLLER(click_gesture));
-
-    click_gesture = gtk_gesture_click_new();
-    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture), 2);
-    g_signal_connect(click_gesture, "released", G_CALLBACK(on_button_released), cdata);
-    gtk_widget_add_controller(button, GTK_EVENT_CONTROLLER(click_gesture));
-
-    gtk_box_append(GTK_BOX(wdata->tab_box), button);
-}
-
 static void clear_group_tabs(uint32_t group_id)
 {
     std::vector<uint32_t> button_order;
@@ -242,8 +379,8 @@ static void clear_group_tabs(uint32_t group_id)
 
     for (auto id : button_order)
     {
-        auto wdata = win_data[view_to_decor[id]];
-        if (wdata->group.id == group_id)
+        auto wdata = lookup_wdata(id);
+        if (wdata && (wdata->group.id == group_id))
         {
             clear_box(wdata->tab_box);
         }
@@ -270,6 +407,7 @@ static void reparent_group(uint32_t group_id, window_data *last_parent)
         }
     }
 }
+
 
 static void refresh_group(uint32_t group_id)
 {
@@ -301,9 +439,17 @@ static void refresh_group(uint32_t group_id)
         }
     }
 
+    /* Collapse a group that has dropped to a single member back to a solo
+     * window. Scope this to THIS group only: refresh_group runs from a deferred
+     * idle, and when a member is dragged from one group into another the old
+     * group's rebuild fires before the new group's strips are built. Scanning
+     * all windows here would see the new group's parent with just its one icon
+     * and wrongly dissolve it (clearing its group id/order), so the second
+     * rebuild then finds no parent and never adds the moved icon. */
     for (auto cdata : win_data)
     {
-        if (get_box_children_count(cdata.second->tab_box) == 1)
+        if ((cdata.second->group.id == group_id) &&
+            (get_box_children_count(cdata.second->tab_box) == 1))
         {
             clear_box(cdata.second->tab_box);
             cdata.second->group.id     = 0;
@@ -314,73 +460,109 @@ static void refresh_group(uint32_t group_id)
     }
 }
 
-// --- Drop Target Setup ---
-static gboolean drop_cb(GtkDropTarget *target,
-    const GValue *value,
-    double x,
-    double y,
-    gpointer user_data)
+/* Client-side bookkeeping after the compositor grouped two windows:
+ * update group ids/order and rebuild the tab strips. Called from the
+ * windows_grouped protocol event. */
+void windows_grouped_notify(uint32_t parent_id, uint32_t child_id)
 {
-    g_print("Drop.\n");
-    auto drop_target_data = (window_data*)user_data;
-    uint32_t group_id     = 1;
+    uint32_t group_id = 1;
 
-    if (G_VALUE_HOLDS(value, G_TYPE_INT))
+    g_print("windows_grouped: parent %u child %u\n", parent_id, child_id);
+
+    auto parent_it = view_to_decor.find(parent_id);
+    auto child_it  = view_to_decor.find(child_id);
+    if ((parent_it == view_to_decor.end()) || (child_it == view_to_decor.end()))
     {
-        auto wf_id = g_value_get_int(value);
-        printf("%s: wf_id: %d\n", __func__, wf_id);
-        if (drop_target_data->wf_id == wf_id)
-        {
-            g_print("Dropped on self, ignoring\n");
-            return false;
-        }
+        return;
+    }
 
-        g_print("Dropped on target, success!\n");
-        group_windows(drop_target_data->wf_id, wf_id);
-        auto drag_source_data = win_data[view_to_decor[wf_id]];
-        if (drag_source_data->group.id)
-        {
-            g_print("Drag source already grouped, ignoring\n");
-            return false;
-        }
+    auto drop_target_data = win_data[parent_it->second];
+    auto drag_source_data = win_data[child_it->second];
+    if (!drop_target_data || !drag_source_data)
+    {
+        return;
+    }
 
-        if (drop_target_data->group.id)
-        {
-            group_id = drop_target_data->group.id;
-        } else
-        {
-            for (auto wdata : win_data)
-            {
-                if (wdata.second->group.id >= group_id)
-                {
-                    group_id = wdata.second->group.id + 1;
-                }
-            }
+    if (drag_source_data->group.id)
+    {
+        g_print("Drag source already grouped, ignoring\n");
+        return;
+    }
 
-            drop_target_data->group.parent = true;
-            drop_target_data->group.id     = group_id;
-            drop_target_data->group.order.push_back(drop_target_data->wf_id);
-        }
-
-        drag_source_data->group.id = group_id;
-
+    if (drop_target_data->group.id)
+    {
+        group_id = drop_target_data->group.id;
+    } else
+    {
         for (auto wdata : win_data)
         {
-            if ((wdata.second->group.id == group_id) && wdata.second->group.parent)
+            if (wdata.second->group.id >= group_id)
             {
-                wdata.second->group.order.push_back(drag_source_data->wf_id);
+                group_id = wdata.second->group.id + 1;
+            }
+        }
+
+        drop_target_data->group.parent = true;
+        drop_target_data->group.id     = group_id;
+        drop_target_data->group.order.push_back(drop_target_data->wf_id);
+    }
+
+    drag_source_data->group.id = group_id;
+
+    for (auto wdata : win_data)
+    {
+        if ((wdata.second->group.id == group_id) && wdata.second->group.parent)
+        {
+            wdata.second->group.order.push_back(drag_source_data->wf_id);
+            break;
+        }
+    }
+
+    g_idle_add(group_rebuild_idle, GUINT_TO_POINTER(group_id));
+}
+
+/* Client-side bookkeeping after the compositor ungrouped a window on its own
+ * (drag-to-ungroup, or leaving one group while being dragged into another).
+ * Same model update as the middle-click path in on_button_released, but the
+ * compositor already performed the ungroup so we do not send it back. */
+void window_ungrouped_notify(uint32_t id)
+{
+    auto wdata = lookup_wdata(id);
+    if (!wdata)
+    {
+        return;
+    }
+
+    auto group_id = wdata->group.id;
+    if (!group_id)
+    {
+        return;
+    }
+
+    g_print("window_ungrouped: id %u (group %u)\n", id, group_id);
+
+    for (auto cdata : win_data)
+    {
+        if (group_id == cdata.second->group.id)
+        {
+            if (cdata.second->group.parent)
+            {
+                cdata.second->group.order.erase(std::remove(cdata.second->group.order.begin(),
+                    cdata.second->group.order.end(), id), cdata.second->group.order.end());
+                if (id == cdata.second->wf_id)
+                {
+                    reparent_group(group_id, wdata.get());
+                }
+
                 break;
             }
         }
-
-        clear_group_tabs(group_id);
-        refresh_group(group_id);
-
-        return true;
     }
 
-    g_print("Drop data does not contain int value. Fail.\n");
-    return false;
+    wdata->group.id = 0;
+
+    auto *ctx = new ungroup_rebuild_ctx{group_id, id};
+    g_idle_add(ungroup_rebuild_idle, ctx);
 }
 
 static gboolean on_scroll_cb(GtkEventControllerScroll *controller,
@@ -441,6 +623,15 @@ GtkWidget *create_deco_window(uint32_t wf_id)
         GTK_POLICY_NEVER);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), tab_box);
     gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(scrolled_window), 115);
+    /* Stop the scroller from claiming horizontal drags for kinetic/touch
+     * panning. Once a group's tab strip overflows its width the scroller
+     * becomes scrollable and its internal pan gesture starts winning pointer
+     * drags over each tab's drag-to-(un)group gesture -- which is why a solo
+     * window (strip fits, not scrollable) drags out fine, but a multi-tab
+     * strip only ever registered the click and morphed instead of dragging.
+     * Wheel scrolling is handled separately in on_scroll_cb, so tab scrolling
+     * is unaffected. */
+    gtk_scrolled_window_set_kinetic_scrolling(GTK_SCROLLED_WINDOW(scrolled_window), FALSE);
     gtk_box_prepend(GTK_BOX(title_box), scrolled_window);
 
     GtkEventController *controller = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
@@ -455,7 +646,14 @@ GtkWidget *create_deco_window(uint32_t wf_id)
     win_data[window] = wdata;
 
     cdata->size_allocate_signal = g_signal_connect(area, "resize", G_CALLBACK(on_area_resized), cdata);
-    g_signal_connect(window, "close-request", G_CALLBACK(on_close_request), wdata.get());
+
+    /* Single capture-phase drag gesture for the whole window; it decides per
+     * press whether a tab/icon (group-drag) or empty titlebar (window-move)
+     * was grabbed. Must be on the window so it runs before the header move. */
+    attach_window_group_drag(window);
+
+    /* Titlebar close button -> ask the compositor to close the real view. */
+    g_signal_connect(window, "close-request", G_CALLBACK(on_deco_close_request), wdata.get());
 
     gtk_window_present(GTK_WINDOW(window));
 
@@ -467,7 +665,7 @@ void destroy_deco_window(uint32_t wf_id)
     auto window = view_to_decor[wf_id];
     if (window)
     {
-        close_window(GTK_WINDOW(window), win_data[window].get());
+        on_close_request(GTK_WINDOW(window), win_data[window].get());
     }
 }
 
@@ -479,17 +677,33 @@ void set_title(GtkWidget *window, const char *title)
 void set_app_id(GtkWidget *window, const char *app_id)
 {
     auto wdata = win_data[window];
+    if (!wdata)
+    {
+        return;
+    }
+
     wdata->app_id = app_id;
 
+    /* Only build the header UI once. app_id_changed can fire more than once
+     * per window; rebuilding here would stack duplicate draggable icons and
+     * duplicate tab buttons, whose extra drag/click gestures then fight each
+     * other and the icons stop responding. */
+    if (wdata->ui_ready)
+    {
+        return;
+    }
+
+    wdata->ui_ready = true;
+
     GtkWidget *image = gtk_image_new_from_icon_name(app_id);
+    gtk_widget_set_can_target(image, TRUE);
+    /* The far-left headerbar app icon is draggable too — this is the icon
+     * people naturally try to grab. It represents the window itself, so a tap
+     * on it should do nothing (tap_selects = FALSE); only dragging it acts. */
+    mark_group_draggable(image, wdata.get(), FALSE);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(wdata->header_bar), image);
 
     add_tab_button(wdata.get(), wdata.get());
-
-    GtkDropTarget *drop_target =
-        gtk_drop_target_new(G_TYPE_INT, GdkDragAction(GDK_ACTION_COPY | GDK_ACTION_MOVE));
-    g_signal_connect(drop_target, "drop", G_CALLBACK(drop_cb), wdata.get());
-    gtk_widget_add_controller(wdata->tab_box, GTK_EVENT_CONTROLLER(drop_target));
 
     gtk_header_bar_pack_start(GTK_HEADER_BAR(wdata->header_bar), wdata->title_box);
 }
@@ -497,6 +711,15 @@ void set_app_id(GtkWidget *window, const char *app_id)
 int main(int argc, char **argv)
 {
     int status;
+
+    /* This decorator speaks a Wayland-only protocol (wf_decorator_manager), so
+     * it must use GDK's Wayland backend. On autostart the environment often has
+     * DISPLAY (XWayland) set, which can make GTK open the X11 backend instead;
+     * it then connects to a display where our protocol does not exist and no
+     * window is ever decorated. Manual launches work only because they set
+     * WAYLAND_DISPLAY. Pin the backend so the launch context can't change it.
+     * Must be called before the display is opened (before g_application_run). */
+    gdk_set_allowed_backends("wayland");
 
     app = gtk_application_new("org.wf.sample-decorator", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

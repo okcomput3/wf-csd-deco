@@ -29,9 +29,14 @@
             <arg name="id" type="uint"/>
         </request>
 
+        <request name="start_group_drag">
+            <arg name="id" type="uint"/>
+        </request>
+
         <request name="close_request">
             <arg name="id" type="uint"/>
         </request>
+
 
         <event name="title_changed">
             <arg name="decoration" type="uint"/>
@@ -41,6 +46,15 @@
         <event name="app_id_changed">
             <arg name="decoration" type="uint"/>
             <arg name="new_app_id" type="string"/>
+        </event>
+
+        <event name="windows_grouped">
+            <arg name="parent" type="uint"/>
+            <arg name="child" type="uint"/>
+        </event>
+
+        <event name="window_ungrouped">
+            <arg name="id" type="uint"/>
         </event>
     </interface>
 </protocol>

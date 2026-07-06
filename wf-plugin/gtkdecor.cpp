@@ -20,6 +20,7 @@
  *
  */
 #include <memory>
+#include <map>
 #include <wayfire/core.hpp>
 #include <wayfire/geometry.hpp>
 #include <wayfire/nonstd/wlroots-full.hpp>
@@ -50,6 +51,15 @@
 #include <wayfire/unstable/wlr-view-events.hpp>
 #include <wayfire/unstable/translation-node.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <wayfire/view-transform.hpp>
+#include <wayfire/output.hpp>
+#include <wayfire/workarea.hpp>
+#include <wayfire/workspace-set.hpp>
+#include <wayfire/view-helpers.hpp>
+#include <linux/input-event-codes.h>
+
 void create_xdg_popup(wlr_xdg_popup *popup);
 
 wf::decoration_margins_t deco_margins =
@@ -68,6 +78,34 @@ std::ostream& operator <<(std::ostream& out, const wf::dimensions_t& dims)
     return out;
 }
 
+/* ─── Wayfire scene-region ABI selector ──────────────────────────────────
+ * Wayfire changed the type of scene-node damage/visibility regions across
+ * the "geometry goes floating-point" refactor:
+ *     recent Wayfire (git master / the 2026 builds)  ->  wf::regionf_t (double)
+ *     older Wayfire  (roughly 2025 and earlier)      ->  wf::region_t  (int)
+ *
+ * This MUST match the Wayfire headers you build against — and those must in
+ * turn match the Wayfire you run, because the compositor refuses to load a
+ * plugin whose baked-in WAYFIRE_API_ABI_VERSION differs from its own.
+ *
+ * Default is 1 (regionf_t), for current / bleeding-edge Wayfire. If the build
+ * fails with a regionf_t/region_t type error on `allowed`,
+ * `schedule_instructions`, or `compute_visibility`, flip this to 0 (and make
+ * sure you are building against the same Wayfire you actually run).
+ *
+ * Pick the right value for a given Wayfire prefix with:
+ *     grep -q regionf_t <prefix>/include/wayfire/region.hpp && echo 1 || echo 0
+ * ──────────────────────────────────────────────────────────────────────── */
+#ifndef DECO_USE_REGIONF
+#define DECO_USE_REGIONF 1
+#endif
+
+#if DECO_USE_REGIONF
+using deco_region_t = wf::regionf_t;
+#else
+using deco_region_t = wf::region_t;
+#endif
+
 /**
  * A node which cuts out a part of its children (visually).
  */
@@ -75,7 +113,7 @@ class gtk4_mask_node_t : public wf::scene::floating_inner_node_t
 {
   public:
     // The rendered part of the decoration which does not include the client buffer area
-    wf::regionf_t allowed;
+    deco_region_t allowed;
 
     gtk4_mask_node_t() : floating_inner_node_t(false)
     {}
@@ -117,7 +155,7 @@ class gtk4_mask_node_t : public wf::scene::floating_inner_node_t
         }
 
         void schedule_instructions(std::vector<wf::scene::render_instruction_t>& instructions,
-            const wf::render_target_t& target, wf::regionf_t& damage) override
+            const wf::render_target_t& target, deco_region_t& damage) override
         {
             auto child_damage = (damage & self->allowed);
             for (auto& ch : children)
@@ -134,7 +172,7 @@ class gtk4_mask_node_t : public wf::scene::floating_inner_node_t
             }
         }
 
-        void compute_visibility(wf::output_t *output, wf::regionf_t& visible) override
+        void compute_visibility(wf::output_t *output, deco_region_t& visible) override
         {
             for (auto& ch : children)
             {
@@ -253,7 +291,7 @@ class gtk4_decoration_object_t : public wf::txn::transaction_object_t
                     LOGD("Adjusting target on deco commit: width: ", box.width, " < ", min_width);
                     wlr_xwayland_surface_configure(wlr_xwayland_surface_try_from_wlr_surface(target_view->
                         get_wlr_surface()),
-                        vg.x, vg.y, std::max(min_width - 11.0, vg.width),
+                        vg.x, vg.y, std::max(min_width - 11.0, (double)vg.width),
                         vg.height - (margin_top + margin_bottom) / 2 - 9);
                 }
             }
@@ -414,6 +452,15 @@ class gtk4_decoration_object_t : public wf::txn::transaction_object_t
             size_updated();
         });
 
+        on_deco_destroy.set_callback([=] (void*)
+        {
+            handle_destroy();
+            if (decorator_resource)
+            {
+                target_view->close();
+            }
+        });
+
         on_target_destroy.set_callback([=] (void*)
         {
             handle_destroy();
@@ -478,6 +525,7 @@ class gtk4_decoration_object_t : public wf::txn::transaction_object_t
         on_new_popup.connect(&wlr_xdg_surface_try_from_wlr_surface(
             deco_node->get_surface())->client->shell->events.new_popup);
         on_commit.connect(&toplevel->base->surface->events.commit);
+        on_deco_destroy.connect(&toplevel->events.destroy);
         if (wlr_xdg_toplevel_try_from_wlr_surface(target_view->get_wlr_surface()))
         {
             on_request_target_maximize.connect(&wlr_xdg_toplevel_try_from_wlr_surface(target_view->
@@ -504,6 +552,7 @@ class gtk4_decoration_object_t : public wf::txn::transaction_object_t
         }
 
         on_commit.disconnect();
+        on_deco_destroy.disconnect();
         on_target_destroy.disconnect();
         on_target_unmapped.disconnect();
         on_new_popup.disconnect();
@@ -619,7 +668,7 @@ class gtk4_decoration_object_t : public wf::txn::transaction_object_t
     wlr_xdg_toplevel *toplevel;
     decoration_node_t deco_node;
 
-    wf::wl_listener_wrapper on_commit, on_target_destroy, on_new_popup;
+    wf::wl_listener_wrapper on_commit, on_deco_destroy, on_target_destroy, on_new_popup;
     wf::wl_listener_wrapper on_request_move, on_request_resize, on_request_minimize;
     wf::wl_listener_wrapper on_request_deco_maximize, on_request_target_maximize;
     gtk4_decoration_tx_state deco_state = gtk4_decoration_tx_state::STABLE;
@@ -631,6 +680,311 @@ class gtk4_toplevel_custom_data : public wf::custom_data_t
     std::shared_ptr<gtk4_decoration_object_t> decoration;
     wf::point_t margin_offset;
 };
+
+/* ------------------------------------------------------------------------- *
+ * Group tab morph animation.
+ *
+ * Adapted from the wf-group-tab (Compiz-style) plugin: uses 2D transformers
+ * to scale/translate/fade live views. When a tab icon is clicked to switch
+ * windows in a group, the new window fades in while morphing from the old
+ * window's exact geometry to its own, and the old window scales toward the
+ * new one behind it. When the animation finishes, the old window is hidden.
+ * ------------------------------------------------------------------------- */
+
+static const char *morph_transformer_name = "gtk4-deco-morph";
+static const int morph_duration_ms = 300;
+
+static void show_view_node(wayfire_view v)
+{
+    while (!v->get_root_node()->is_enabled())
+    {
+        wf::scene::set_node_enabled(v->get_root_node(), true);
+    }
+}
+
+static void hide_view_node(wayfire_view v)
+{
+    while (v->get_root_node()->is_enabled())
+    {
+        wf::scene::set_node_enabled(v->get_root_node(), false);
+    }
+}
+
+static wayfire_view find_view_by_id(uint32_t id)
+{
+    for (auto& v : wf::get_core().get_all_views())
+    {
+        if ((v->role == wf::VIEW_ROLE_TOPLEVEL) && (v->get_id() == id))
+        {
+            return v;
+        }
+    }
+
+    return nullptr;
+}
+
+/**
+ * Scale + translation which place @view exactly inside @rect.
+ * The 2D transformer scales around the center of the view's current
+ * geometry, hence the correction terms. (From wf-group-tab.)
+ */
+static void transform_for_rect(wayfire_view view, const wf::geometry_t& rect,
+    double& sx, double& sy, double& tx, double& ty)
+{
+    auto g = wf::toplevel_cast(view)->get_geometry();
+    sx = (g.width > 0) ? ((double)rect.width / g.width) : 1.0;
+    sy = (g.height > 0) ? ((double)rect.height / g.height) : 1.0;
+
+    double x_after_scale = g.x + g.width * (1.0 - sx) / 2.0;
+    double y_after_scale = g.y + g.height * (1.0 - sy) / 2.0;
+
+    tx = rect.x - x_after_scale;
+    ty = rect.y - y_after_scale;
+}
+
+/* ------------------------------ morph ------------------------------ */
+
+struct morph_state_t
+{
+    bool active = false;
+    wayfire_view old_view = nullptr;
+    wayfire_view new_view = nullptr;
+    std::shared_ptr<wf::scene::view_2d_transformer_t> old_tr, new_tr;
+    /* old view: identity -> (o_*); new view: (n_*) -> identity */
+    double o_sx1 = 1, o_sy1 = 1, o_tx1 = 0, o_ty1 = 0;
+    double n_sx0 = 1, n_sy0 = 1, n_tx0 = 0, n_ty0 = 0;
+    uint32_t start_time = 0;
+    wf::output_t *output = nullptr;
+};
+
+static morph_state_t morph;
+static void morph_frame();
+static wf::effect_hook_t morph_hook = [] () { morph_frame(); };
+
+/* Which view id is currently shown for each group id. The morph source is
+ * looked up here instead of being inferred from scene enable state, which can
+ * drift after a few switches and leave nothing to morph from (the switch then
+ * snaps instead of morphing). */
+static std::map<uint32_t, uint32_t> group_visible;
+
+static void finish_morph()
+{
+    if (!morph.active)
+    {
+        return;
+    }
+
+    if (morph.output)
+    {
+        morph.output->render->rem_effect(&morph_hook);
+    }
+
+    if (morph.old_view)
+    {
+        morph.old_view->damage();
+        morph.old_view->get_transformed_node()->rem_transformer(morph_transformer_name);
+        if (morph.old_view->is_mapped())
+        {
+            hide_view_node(morph.old_view);
+        }
+
+        morph.old_view->damage();
+    }
+
+    if (morph.new_view)
+    {
+        morph.new_view->damage();
+        morph.new_view->get_transformed_node()->rem_transformer(morph_transformer_name);
+        morph.new_view->damage();
+    }
+
+    morph = morph_state_t{};
+}
+
+static void start_morph(wayfire_view old_view, wayfire_view new_view)
+{
+    finish_morph();
+
+    if (!old_view || !new_view || (old_view == new_view))
+    {
+        return;
+    }
+
+    auto output = new_view->get_output() ? new_view->get_output() : old_view->get_output();
+    if (!output)
+    {
+        /* Can't animate without an output; fall back to instant switch. */
+        hide_view_node(old_view);
+        return;
+    }
+
+    auto og = wf::toplevel_cast(old_view)->get_geometry();
+    auto ng = wf::toplevel_cast(new_view)->get_geometry();
+
+    morph.old_view = old_view;
+    morph.new_view = new_view;
+    morph.output   = output;
+
+    morph.old_tr = std::make_shared<wf::scene::view_2d_transformer_t>(old_view);
+    old_view->get_transformed_node()->add_transformer(
+        morph.old_tr, wf::TRANSFORMER_2D, morph_transformer_name);
+    morph.new_tr = std::make_shared<wf::scene::view_2d_transformer_t>(new_view);
+    new_view->get_transformed_node()->add_transformer(
+        morph.new_tr, wf::TRANSFORMER_2D, morph_transformer_name);
+
+    /* Old window ends shaped like the new one; new window starts shaped
+     * like the old one and fades in on top of it. */
+    transform_for_rect(old_view, ng, morph.o_sx1, morph.o_sy1, morph.o_tx1, morph.o_ty1);
+    transform_for_rect(new_view, og, morph.n_sx0, morph.n_sy0, morph.n_tx0, morph.n_ty0);
+
+    morph.new_tr->scale_x = morph.n_sx0;
+    morph.new_tr->scale_y = morph.n_sy0;
+    morph.new_tr->translation_x = morph.n_tx0;
+    morph.new_tr->translation_y = morph.n_ty0;
+    morph.new_tr->alpha = 0.0;
+
+    morph.start_time = wf::get_current_time();
+    morph.active     = true;
+
+    output->render->add_effect(&morph_hook, wf::OUTPUT_EFFECT_PRE);
+    old_view->damage();
+    new_view->damage();
+}
+
+static void morph_frame()
+{
+    if (!morph.active)
+    {
+        return;
+    }
+
+    if (!morph.old_view || !morph.new_view ||
+        !morph.old_view->is_mapped() || !morph.new_view->is_mapped())
+    {
+        finish_morph();
+        return;
+    }
+
+    double p = (double)(wf::get_current_time() - morph.start_time) / morph_duration_ms;
+    p = std::clamp(p, 0.0, 1.0);
+    double e = p * p * (3.0 - 2.0 * p); /* smoothstep easing */
+
+    morph.old_view->damage();
+    morph.new_view->damage();
+
+    morph.old_tr->scale_x = 1.0 + (morph.o_sx1 - 1.0) * e;
+    morph.old_tr->scale_y = 1.0 + (morph.o_sy1 - 1.0) * e;
+    morph.old_tr->translation_x = morph.o_tx1 * e;
+    morph.old_tr->translation_y = morph.o_ty1 * e;
+
+    morph.new_tr->scale_x = morph.n_sx0 + (1.0 - morph.n_sx0) * e;
+    morph.new_tr->scale_y = morph.n_sy0 + (1.0 - morph.n_sy0) * e;
+    morph.new_tr->translation_x = morph.n_tx0 * (1.0 - e);
+    morph.new_tr->translation_y = morph.n_ty0 * (1.0 - e);
+    morph.new_tr->alpha = e;
+
+    morph.old_view->damage();
+    morph.new_view->damage();
+
+    if (p >= 1.0)
+    {
+        finish_morph();
+    }
+}
+
+/* --------------------------- group drag ---------------------------- *
+ * Compositor-side drag-to-group. GTK drag-and-drop is unreliable on the
+ * decoration surfaces (the button's internal gestures and the wayland DnD
+ * grab fight over the pointer), so instead the client just tells us when a
+ * drag begins on a titlebar icon. We dim the source window, switch the
+ * cursor, and on button release group it with whatever toplevel is under
+ * the cursor — anywhere on the target window works, not just its titlebar.
+ * The client is notified via the windows_grouped event so it can rebuild
+ * its tab strips. */
+
+struct group_drag_t
+{
+    bool active = false;
+    wayfire_view source = nullptr;
+    std::shared_ptr<wf::scene::view_2d_transformer_t> dim;
+};
+
+static group_drag_t gdrag;
+static const char *drag_transformer_name = "gtk4-deco-drag";
+
+static void cancel_group_drag()
+{
+    if (!gdrag.active)
+    {
+        return;
+    }
+
+    if (gdrag.source)
+    {
+        gdrag.source->damage();
+        gdrag.source->get_transformed_node()->rem_transformer(drag_transformer_name);
+        gdrag.source->damage();
+    }
+
+    wf::get_core().set_cursor("default");
+    gdrag = group_drag_t{};
+}
+
+/* Hard reset. Cancels any in-flight morph/drag and removes every transformer
+ * this plugin can add from every toplevel, so the view tree is back to a
+ * known-clean state. Called at the start of each tab switch so a click always
+ * works, even if a previous animation left a stuck transformer (which is what
+ * makes a window go invisible / tiny / "not morph"). */
+static void reset_all_deco_transforms()
+{
+    finish_morph();
+    cancel_group_drag();
+
+    for (auto& v : wf::get_core().get_all_views())
+    {
+        if (v->role != wf::VIEW_ROLE_TOPLEVEL)
+        {
+            continue;
+        }
+
+        auto node = v->get_transformed_node();
+        node->rem_transformer(morph_transformer_name);
+        node->rem_transformer(drag_transformer_name);
+        v->damage();
+    }
+}
+
+void do_start_group_drag(wl_client*, struct wl_resource*, uint32_t id)
+{
+    cancel_group_drag();
+
+    auto view = find_view_by_id(id);
+    if (!view)
+    {
+        return;
+    }
+
+    auto data = wf::toplevel_cast(view)->toplevel()->get_data<gtk4_toplevel_custom_data>();
+    if (!data || !data->decoration)
+    {
+        /* Only decorated windows can be dragged. Grouped windows are allowed:
+         * dropping over another window regroups them, dropping over empty
+         * space pulls them back out of their group. */
+        return;
+    }
+
+    gdrag.active = true;
+    gdrag.source = view;
+    gdrag.dim    = std::make_shared<wf::scene::view_2d_transformer_t>(view);
+    view->get_transformed_node()->add_transformer(
+        gdrag.dim, wf::TRANSFORMER_2D, drag_transformer_name);
+    view->damage();
+    gdrag.dim->alpha = 0.85;
+    view->damage();
+
+    wf::get_core().set_cursor("grabbing");
+    LOGI("Group drag started for view ", id);
+}
 
 void do_update_borders(wl_client*, struct wl_resource*, uint32_t id, uint32_t top, uint32_t bottom,
     uint32_t left, uint32_t right)
@@ -671,6 +1025,8 @@ void do_update_borders(wl_client*, struct wl_resource*, uint32_t id, uint32_t to
 
 void do_group_windows(wl_client*, struct wl_resource*, uint32_t parent_id, uint32_t child_id)
 {
+    finish_morph();
+
     uint32_t group_id = 1;
     wayfire_view parent = nullptr, child = nullptr;
     for (auto& v : wf::get_core().get_all_views())
@@ -760,6 +1116,10 @@ void do_select_window(wl_client*, struct wl_resource*, uint32_t select_id)
         return;
     }
 
+    /* Reset to a clean state on every click so the switch always works,
+     * regardless of what a previous morph/drag left behind. */
+    reset_all_deco_transforms();
+
     auto view_data = wf::toplevel_cast(view)->toplevel()->get_data<gtk4_toplevel_custom_data>();
 
     if (!view_data)
@@ -767,23 +1127,65 @@ void do_select_window(wl_client*, struct wl_resource*, uint32_t select_id)
         return;
     }
 
-    while (!view->get_root_node()->is_enabled())
+    auto group_id = view_data->decoration->group_id;
+
+    /* The morph source is the window that was visible in this group before
+     * this click. Prefer the explicitly tracked one; fall back to scanning
+     * enabled nodes (first switch, or if the tracked window went away). */
+    wayfire_view old_visible = nullptr;
+    if (group_id)
     {
-        wf::scene::set_node_enabled(view->get_root_node(), true);
+        auto it = group_visible.find(group_id);
+        if ((it != group_visible.end()) && (it->second != select_id))
+        {
+            auto candidate = find_view_by_id(it->second);
+            if (candidate && candidate->is_mapped())
+            {
+                auto cdata = wf::toplevel_cast(candidate)->toplevel()->get_data<gtk4_toplevel_custom_data>();
+                if (cdata && cdata->decoration && (cdata->decoration->group_id == group_id))
+                {
+                    old_visible = candidate;
+                }
+            }
+        }
+
+        if (!old_visible)
+        {
+            for (auto& v : wf::get_core().get_all_views())
+            {
+                if ((v->role != wf::VIEW_ROLE_TOPLEVEL) || (v == view))
+                {
+                    continue;
+                }
+
+                auto data = wf::toplevel_cast(v)->toplevel()->get_data<gtk4_toplevel_custom_data>();
+                if (data && data->decoration && (data->decoration->group_id == group_id) &&
+                    v->get_root_node()->is_enabled())
+                {
+                    old_visible = v;
+                    break;
+                }
+            }
+        }
     }
 
+    show_view_node(view);
     wf::get_core().default_wm->focus_raise_view(view);
-
-    auto group_id = view_data->decoration->group_id;
 
     if (!group_id)
     {
         return;
     }
 
+    /* Record the new visible window for this group. */
+    group_visible[group_id] = select_id;
+
+    /* Hide every other member immediately, except the previously visible
+     * window: that one stays on screen for the morph animation and is
+     * hidden when the morph finishes. */
     for (auto& v : wf::get_core().get_all_views())
     {
-        if ((v->role != wf::VIEW_ROLE_TOPLEVEL) || (v == view))
+        if ((v->role != wf::VIEW_ROLE_TOPLEVEL) || (v == view) || (v == old_visible))
         {
             continue;
         }
@@ -800,10 +1202,27 @@ void do_select_window(wl_client*, struct wl_resource*, uint32_t select_id)
             }
         }
     }
+
+    if (old_visible)
+    {
+        /* Make sure the source is on-screen for the animation, then morph.
+         * finish_morph() hides it again when the animation completes. */
+        show_view_node(old_visible);
+        start_morph(old_visible, view);
+    }
 }
 
 void ungroup_window(wl_client*, struct wl_resource*, uint32_t id, bool closing)
 {
+    /* Ungrouping (also called on view destruction) invalidates any in-flight
+     * morph involving this view. */
+    if (morph.active &&
+        ((morph.old_view && (morph.old_view->get_id() == id)) ||
+         (morph.new_view && (morph.new_view->get_id() == id))))
+    {
+        finish_morph();
+    }
+
     wayfire_view view = nullptr;
     for (auto& v : wf::get_core().get_all_views())
     {
@@ -894,38 +1313,24 @@ void do_ungroup_window(wl_client*, struct wl_resource*, uint32_t id)
     ungroup_window(NULL, NULL, id, false);
 }
 
+/* Client asks the compositor to close a view (e.g. a titlebar close button). */
 void do_close_request(wl_client*, struct wl_resource*, uint32_t id)
 {
-    wayfire_view view = nullptr;
-    for (auto& v : wf::get_core().get_all_views())
+    auto view = find_view_by_id(id);
+    if (view)
     {
-        if (v->role != wf::VIEW_ROLE_TOPLEVEL)
-        {
-            continue;
-        }
-
-        if (v->get_id() == id)
-        {
-            view = v;
-            break;
-        }
+        view->close();
     }
-
-    if (!view)
-    {
-        return;
-    }
-
-    view->close();
 }
 
 const struct wf_decorator_manager_interface decorator_implementation =
 {
-    .update_borders = do_update_borders,
-    .group_windows  = do_group_windows,
-    .select_window  = do_select_window,
-    .ungroup_window = do_ungroup_window,
-    .close_request  = do_close_request
+    .update_borders   = do_update_borders,
+    .group_windows    = do_group_windows,
+    .select_window    = do_select_window,
+    .ungroup_window   = do_ungroup_window,
+    .start_group_drag = do_start_group_drag,
+    .close_request    = do_close_request
 };
 
 void unbind_decorator(wl_resource*)
@@ -936,6 +1341,7 @@ void unbind_decorator(wl_resource*)
 
 static void handle_deco_client_destroy(struct wl_listener *listener, void *data)
 {
+    cancel_group_drag();
     unbind_decorator(NULL);
     for (auto & node : deco_nodes)
     {
@@ -978,6 +1384,110 @@ class gtk4_decoration_plugin : public wf::plugin_interface_t
 {
   public:
     wl_global *decorator_global;
+
+    /* Completes a compositor-side group drag: on button release, group the
+     * dragged window with the toplevel under the cursor. This is a raw
+     * input signal, so it fires regardless of grabs. */
+    wf::signal::connection_t<wf::input_event_signal<wlr_pointer_button_event>> on_pointer_button =
+        [=] (wf::input_event_signal<wlr_pointer_button_event> *ev)
+    {
+        if (!gdrag.active || !ev->event)
+        {
+            return;
+        }
+
+        if ((ev->event->state != WL_POINTER_BUTTON_STATE_RELEASED) ||
+            (ev->event->button != BTN_LEFT))
+        {
+            return;
+        }
+
+        auto source = gdrag.source;
+        cancel_group_drag();
+
+        if (!source || !source->is_mapped())
+        {
+            return;
+        }
+
+        auto sdata = wf::toplevel_cast(source)->toplevel()->get_data<gtk4_toplevel_custom_data>();
+        uint32_t src_group = (sdata && sdata->decoration) ? sdata->decoration->group_id : 0;
+
+        /* Find a decorated toplevel (other than the source) under the cursor. */
+        wayfire_view target = nullptr;
+        uint32_t tgt_group  = 0;
+        auto cursor = wf::get_core().get_cursor_position();
+        auto isec   = wf::get_core().scene()->find_node_at(cursor);
+        if (isec)
+        {
+            auto v = wf::node_to_view(isec->node.get());
+            if (v && (v != source) && (v->role == wf::VIEW_ROLE_TOPLEVEL))
+            {
+                auto tdata = wf::toplevel_cast(v)->toplevel()->get_data<gtk4_toplevel_custom_data>();
+                if (tdata && tdata->decoration)
+                {
+                    target    = v;
+                    tgt_group = tdata->decoration->group_id;
+                }
+            }
+        }
+
+        /* Two ungrouped windows dropped together -> start a new group. */
+        if (target && (src_group == 0) && (tgt_group == 0))
+        {
+            LOGI("Group drag: grouping ", source->get_id(), " onto ", target->get_id());
+            do_group_windows(NULL, NULL, target->get_id(), source->get_id());
+            if (decorator_resource)
+            {
+                wf_decorator_manager_send_windows_grouped(decorator_resource,
+                    target->get_id(), source->get_id());
+            }
+
+            return;
+        }
+
+        /* Dropped over a window in a *different* group (this also covers
+         * dropping onto an ungrouped window while the source is grouped, and
+         * dropping a grouped source onto another group). Move the source into
+         * the target's group, leaving its old group first. */
+        if (target && (tgt_group != src_group))
+        {
+            if (src_group)
+            {
+                LOGI("Group drag: moving ", source->get_id(), " out of group ", src_group);
+                ungroup_window(NULL, NULL, source->get_id(), false);
+                if (decorator_resource)
+                {
+                    wf_decorator_manager_send_window_ungrouped(decorator_resource, source->get_id());
+                }
+            }
+
+            LOGI("Group drag: grouping ", source->get_id(), " onto ", target->get_id());
+            do_group_windows(NULL, NULL, target->get_id(), source->get_id());
+            if (decorator_resource)
+            {
+                wf_decorator_manager_send_windows_grouped(decorator_resource,
+                    target->get_id(), source->get_id());
+            }
+
+            return;
+        }
+
+        /* Everything else means the source was NOT dropped onto a different
+         * group: empty space, a non-decorated surface, or back onto its own
+         * group's window. If the source is grouped, this is a "drag out" ->
+         * pull it out of its group. A lone (ungrouped) window dropped on
+         * nothing is a no-op. */
+        if (src_group)
+        {
+            LOGI("Group drag: dragging ", source->get_id(), " out of group ", src_group);
+            ungroup_window(NULL, NULL, source->get_id(), false);
+            if (decorator_resource)
+            {
+                wf_decorator_manager_send_window_ungrouped(decorator_resource, source->get_id());
+            }
+        }
+    };
 
     wf::signal::connection_t<wf::view_geometry_changed_signal> on_view_geometry_changed =
         [=] (wf::view_geometry_changed_signal *ev)
@@ -1222,7 +1732,14 @@ class gtk4_decoration_plugin : public wf::plugin_interface_t
         wf::get_core().connect(&on_mapped);
         wf::get_core().connect(&on_pre_map);
         wf::get_core().connect(&on_view_geometry_changed);
+        wf::get_core().connect(&on_pointer_button);
         wf::get_core().tx_manager->connect(&on_new_tx);
+    }
+
+    void fini() override
+    {
+        cancel_group_drag();
+        finish_morph();
     }
 };
 
