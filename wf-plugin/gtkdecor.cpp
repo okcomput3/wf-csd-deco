@@ -694,6 +694,21 @@ class gtk4_toplevel_custom_data : public wf::custom_data_t
 static const char *morph_transformer_name = "gtk4-deco-morph";
 static const int morph_duration_ms = 300;
 
+/* --- group / ungroup morph tunables ---------------------------------------
+ * Durations are per-effect; the *_spring_k values control how much the scale
+ * and translation overshoot past their target before settling (0 = none, ~1 =
+ * lively, >1.5 = bouncy). The alpha ramps are the dependency-free "blur":
+ * a window fades through translucency while it scales, reading as a soft,
+ * motion-blurred morph rather than a hard cut. */
+static const int    group_anim_ms       = 380;  /* implode-into-parent length  */
+static const int    ungroup_anim_ms     = 430;  /* burst-out length            */
+static const double tab_spring_k        = 0.9;   /* tab-switch overshoot        */
+static const double group_spring_k      = 1.15;  /* implode overshoot           */
+static const double ungroup_spring_k    = 1.7;   /* burst overshoot (dramatic)  */
+static const double parent_pulse_amp    = 0.07;  /* parent "welcome" scale bump */
+static const double reveal_pop_scale    = 0.90;  /* revealed member start scale */
+static const double ungroup_start_alpha = 0.20;  /* leaving view initial softness */
+
 static void show_view_node(wayfire_view v)
 {
     while (!v->get_root_node()->is_enabled())
@@ -742,18 +757,70 @@ static void transform_for_rect(wayfire_view view, const wf::geometry_t& rect,
     ty = rect.y - y_after_scale;
 }
 
-/* ------------------------------ morph ------------------------------ */
+/* ------------------------------ morph ------------------------------ *
+ *
+ * Generalized spring-morph engine. Every effect here (tab switch, group,
+ * ungroup) animates at most two live views through view_2d_transformer_t.
+ * Each "slot" interpolates scale + translation + alpha from a start pose to
+ * an end pose using two curves:
+ *   - a spring / ease-out-back curve drives scale & translation, giving the
+ *     dramatic snap-together / burst-apart overshoot;
+ *   - a plain smoothstep drives alpha, so opacity never leaves [0, 1].
+ * A slot may instead be a "pulse": a scale bump that rises and returns to 1,
+ * used to make the surviving window acknowledge a group/ungroup.
+ * The soft alpha ramps are the dependency-free "blur": a view fades through
+ * translucency while it scales, reading as a motion-blurred morph rather than
+ * a hard cut. (True per-pixel blur would need a shader transformer.)
+ * ------------------------------------------------------------------------- */
+
+static constexpr double DECO_PI = 3.14159265358979323846;
+
+/* Smoothstep, 0..1, no overshoot. Used for alpha. */
+static double ease_smooth(double p)
+{
+    return p * p * (3.0 - 2.0 * p);
+}
+
+/* Ease-out-back (spring): overshoots past 1, then settles to exactly 1 at
+ * p == 1. `k` scales the overshoot amount. */
+static double ease_spring(double p, double k)
+{
+    const double c1 = 1.70158 * k;
+    const double c3 = c1 + 1.0;
+    const double q  = p - 1.0;
+    return 1.0 + c3 * q * q * q + c1 * q * q;
+}
+
+struct anim_slot_t
+{
+    wayfire_view view = nullptr;
+    std::shared_ptr<wf::scene::view_2d_transformer_t> tr;
+
+    /* scale / translation: start -> end */
+    double sx0 = 1, sy0 = 1, tx0 = 0, ty0 = 0;
+    double sx1 = 1, sy1 = 1, tx1 = 0, ty1 = 0;
+    /* alpha: start -> end */
+    double a0 = 1, a1 = 1;
+
+    bool   spring = false;    /* spring easing for scale/translation      */
+    bool   pulse  = false;    /* scale bump 1 -> 1+amp -> 1 (ignores s/t)  */
+    double pulse_amp = 0.0;
+
+    bool   hide_on_finish = false;
+    bool   move_on_finish = false;
+    double move_x = 0, move_y = 0;
+};
 
 struct morph_state_t
 {
     bool active = false;
-    wayfire_view old_view = nullptr;
-    wayfire_view new_view = nullptr;
-    std::shared_ptr<wf::scene::view_2d_transformer_t> old_tr, new_tr;
-    /* old view: identity -> (o_*); new view: (n_*) -> identity */
-    double o_sx1 = 1, o_sy1 = 1, o_tx1 = 0, o_ty1 = 0;
-    double n_sx0 = 1, n_sy0 = 1, n_tx0 = 0, n_ty0 = 0;
+    /* "old"/"new" names kept so existing call sites keep compiling; each is
+     * simply one of the (at most two) animated slots. */
+    anim_slot_t old_slot;
+    anim_slot_t new_slot;
     uint32_t start_time = 0;
+    int      duration_ms = morph_duration_ms;
+    double   spring_k = 1.0;
     wf::output_t *output = nullptr;
 };
 
@@ -767,6 +834,29 @@ static wf::effect_hook_t morph_hook = [] () { morph_frame(); };
  * snaps instead of morphing). */
 static std::map<uint32_t, uint32_t> group_visible;
 
+static void finish_slot(anim_slot_t& s)
+{
+    if (!s.view)
+    {
+        return;
+    }
+
+    s.view->damage();
+    s.view->get_transformed_node()->rem_transformer(morph_transformer_name);
+
+    if (s.move_on_finish && wf::toplevel_cast(s.view))
+    {
+        wf::toplevel_cast(s.view)->move(s.move_x, s.move_y);
+    }
+
+    if (s.hide_on_finish && s.view->is_mapped())
+    {
+        hide_view_node(s.view);
+    }
+
+    s.view->damage();
+}
+
 static void finish_morph()
 {
     if (!morph.active)
@@ -779,28 +869,144 @@ static void finish_morph()
         morph.output->render->rem_effect(&morph_hook);
     }
 
-    if (morph.old_view)
-    {
-        morph.old_view->damage();
-        morph.old_view->get_transformed_node()->rem_transformer(morph_transformer_name);
-        if (morph.old_view->is_mapped())
-        {
-            hide_view_node(morph.old_view);
-        }
-
-        morph.old_view->damage();
-    }
-
-    if (morph.new_view)
-    {
-        morph.new_view->damage();
-        morph.new_view->get_transformed_node()->rem_transformer(morph_transformer_name);
-        morph.new_view->damage();
-    }
+    finish_slot(morph.old_slot);
+    finish_slot(morph.new_slot);
 
     morph = morph_state_t{};
 }
 
+/* Attach a fresh 2D transformer and prime it to the slot's start pose. */
+static void attach_slot(anim_slot_t& s)
+{
+    if (!s.view)
+    {
+        return;
+    }
+
+    s.tr = std::make_shared<wf::scene::view_2d_transformer_t>(s.view);
+    s.view->get_transformed_node()->add_transformer(
+        s.tr, wf::TRANSFORMER_2D, morph_transformer_name);
+
+    if (s.pulse)
+    {
+        s.tr->scale_x = s.tr->scale_y = 1.0;
+        s.tr->translation_x = s.tr->translation_y = 0.0;
+    } else
+    {
+        s.tr->scale_x = s.sx0;
+        s.tr->scale_y = s.sy0;
+        s.tr->translation_x = s.tx0;
+        s.tr->translation_y = s.ty0;
+    }
+
+    s.tr->alpha = std::clamp(s.a0, 0.0, 1.0);
+}
+
+static void begin_morph(wf::output_t *output, int duration_ms, double spring_k)
+{
+    morph.output      = output;
+    morph.duration_ms = duration_ms;
+    morph.spring_k    = spring_k;
+    morph.start_time  = wf::get_current_time();
+    morph.active      = true;
+
+    attach_slot(morph.old_slot);
+    attach_slot(morph.new_slot);
+
+    output->render->add_effect(&morph_hook, wf::OUTPUT_EFFECT_PRE);
+
+    if (morph.old_slot.view)
+    {
+        morph.old_slot.view->damage();
+    }
+
+    if (morph.new_slot.view)
+    {
+        morph.new_slot.view->damage();
+    }
+}
+
+static void apply_slot(anim_slot_t& s, double p, double spring_k)
+{
+    if (!s.tr)
+    {
+        return;
+    }
+
+    if (s.pulse)
+    {
+        double b = s.pulse_amp * std::sin(DECO_PI * p);
+        s.tr->scale_x = 1.0 + b;
+        s.tr->scale_y = 1.0 + b;
+        s.tr->translation_x = 0.0;
+        s.tr->translation_y = 0.0;
+        s.tr->alpha = std::clamp(s.a0 + (s.a1 - s.a0) * ease_smooth(p), 0.0, 1.0);
+        return;
+    }
+
+    double e_pos = s.spring ? ease_spring(p, spring_k) : ease_smooth(p);
+    double e_a   = ease_smooth(p);
+
+    s.tr->scale_x = s.sx0 + (s.sx1 - s.sx0) * e_pos;
+    s.tr->scale_y = s.sy0 + (s.sy1 - s.sy0) * e_pos;
+    s.tr->translation_x = s.tx0 + (s.tx1 - s.tx0) * e_pos;
+    s.tr->translation_y = s.ty0 + (s.ty1 - s.ty0) * e_pos;
+    s.tr->alpha = std::clamp(s.a0 + (s.a1 - s.a0) * e_a, 0.0, 1.0);
+}
+
+static void morph_frame()
+{
+    if (!morph.active)
+    {
+        return;
+    }
+
+    /* Any participating view disappearing aborts the animation cleanly. */
+    auto gone = [] (anim_slot_t& s) {
+        return s.view && !s.view->is_mapped();
+    };
+    if (gone(morph.old_slot) || gone(morph.new_slot))
+    {
+        finish_morph();
+        return;
+    }
+
+    double p = (double)(wf::get_current_time() - morph.start_time) / morph.duration_ms;
+    p = std::clamp(p, 0.0, 1.0);
+
+    if (morph.old_slot.view)
+    {
+        morph.old_slot.view->damage();
+    }
+
+    if (morph.new_slot.view)
+    {
+        morph.new_slot.view->damage();
+    }
+
+    apply_slot(morph.old_slot, p, morph.spring_k);
+    apply_slot(morph.new_slot, p, morph.spring_k);
+
+    if (morph.old_slot.view)
+    {
+        morph.old_slot.view->damage();
+    }
+
+    if (morph.new_slot.view)
+    {
+        morph.new_slot.view->damage();
+    }
+
+    if (p >= 1.0)
+    {
+        finish_morph();
+    }
+}
+
+/* ------------------------- effect builders ------------------------- */
+
+/* Tab switch: the old view stays opaque and springs toward the new geometry,
+ * the new view springs in from the old geometry while fading up on top. */
 static void start_morph(wayfire_view old_view, wayfire_view new_view)
 {
     finish_morph();
@@ -821,75 +1027,106 @@ static void start_morph(wayfire_view old_view, wayfire_view new_view)
     auto og = wf::toplevel_cast(old_view)->get_geometry();
     auto ng = wf::toplevel_cast(new_view)->get_geometry();
 
-    morph.old_view = old_view;
-    morph.new_view = new_view;
-    morph.output   = output;
+    anim_slot_t o;
+    o.view = old_view;
+    transform_for_rect(old_view, ng, o.sx1, o.sy1, o.tx1, o.ty1);
+    o.a0 = 1.0; o.a1 = 1.0;
+    o.spring = true;
+    o.hide_on_finish = true;
 
-    morph.old_tr = std::make_shared<wf::scene::view_2d_transformer_t>(old_view);
-    old_view->get_transformed_node()->add_transformer(
-        morph.old_tr, wf::TRANSFORMER_2D, morph_transformer_name);
-    morph.new_tr = std::make_shared<wf::scene::view_2d_transformer_t>(new_view);
-    new_view->get_transformed_node()->add_transformer(
-        morph.new_tr, wf::TRANSFORMER_2D, morph_transformer_name);
+    anim_slot_t n;
+    n.view = new_view;
+    transform_for_rect(new_view, og, n.sx0, n.sy0, n.tx0, n.ty0);
+    n.a0 = 0.0; n.a1 = 1.0;
+    n.spring = true;
 
-    /* Old window ends shaped like the new one; new window starts shaped
-     * like the old one and fades in on top of it. */
-    transform_for_rect(old_view, ng, morph.o_sx1, morph.o_sy1, morph.o_tx1, morph.o_ty1);
-    transform_for_rect(new_view, og, morph.n_sx0, morph.n_sy0, morph.n_tx0, morph.n_ty0);
-
-    morph.new_tr->scale_x = morph.n_sx0;
-    morph.new_tr->scale_y = morph.n_sy0;
-    morph.new_tr->translation_x = morph.n_tx0;
-    morph.new_tr->translation_y = morph.n_ty0;
-    morph.new_tr->alpha = 0.0;
-
-    morph.start_time = wf::get_current_time();
-    morph.active     = true;
-
-    output->render->add_effect(&morph_hook, wf::OUTPUT_EFFECT_PRE);
-    old_view->damage();
-    new_view->damage();
+    morph.old_slot = o;
+    morph.new_slot = n;
+    begin_morph(output, morph_duration_ms, tab_spring_k);
 }
 
-static void morph_frame()
+/* Group: the child implodes into and dissolves onto the parent, which pulses
+ * to acknowledge it. The child is stacked on the parent and hidden when the
+ * animation finishes (the move/hide is deferred to finish_slot). */
+static void start_group_anim(wayfire_view child, wayfire_view parent,
+    const wf::geometry_t& parent_geom)
 {
-    if (!morph.active)
+    finish_morph();
+
+    if (!child || !parent || (child == parent))
     {
         return;
     }
 
-    if (!morph.old_view || !morph.new_view ||
-        !morph.old_view->is_mapped() || !morph.new_view->is_mapped())
+    auto output = child->get_output() ? child->get_output() : parent->get_output();
+    if (!output)
     {
-        finish_morph();
         return;
     }
 
-    double p = (double)(wf::get_current_time() - morph.start_time) / morph_duration_ms;
-    p = std::clamp(p, 0.0, 1.0);
-    double e = p * p * (3.0 - 2.0 * p); /* smoothstep easing */
+    anim_slot_t c;
+    c.view = child;
+    transform_for_rect(child, parent_geom, c.sx1, c.sy1, c.tx1, c.ty1);
+    c.a0 = 1.0; c.a1 = 0.0;               /* dissolve as it is absorbed */
+    c.spring = true;
+    c.hide_on_finish = true;
+    c.move_on_finish = true;
+    c.move_x = parent_geom.x;
+    c.move_y = parent_geom.y;
 
-    morph.old_view->damage();
-    morph.new_view->damage();
+    anim_slot_t p;
+    p.view = parent;
+    p.pulse = true;
+    p.pulse_amp = parent_pulse_amp;
 
-    morph.old_tr->scale_x = 1.0 + (morph.o_sx1 - 1.0) * e;
-    morph.old_tr->scale_y = 1.0 + (morph.o_sy1 - 1.0) * e;
-    morph.old_tr->translation_x = morph.o_tx1 * e;
-    morph.old_tr->translation_y = morph.o_ty1 * e;
+    morph.old_slot = c;
+    morph.new_slot = p;
+    begin_morph(output, group_anim_ms, group_spring_k);
+}
 
-    morph.new_tr->scale_x = morph.n_sx0 + (1.0 - morph.n_sx0) * e;
-    morph.new_tr->scale_y = morph.n_sy0 + (1.0 - morph.n_sy0) * e;
-    morph.new_tr->translation_x = morph.n_tx0 * (1.0 - e);
-    morph.new_tr->translation_y = morph.n_ty0 * (1.0 - e);
-    morph.new_tr->alpha = e;
+/* Ungroup: the leaving view bursts out from where it sat in the group to its
+ * restore geometry, sharpening from a soft dissolve with a big overshoot; a
+ * newly revealed group member (if any) pops in behind it. */
+static void start_ungroup_anim(wayfire_view leaving, const wf::geometry_t& grouped_geom,
+    wayfire_view revealed)
+{
+    finish_morph();
 
-    morph.old_view->damage();
-    morph.new_view->damage();
-
-    if (p >= 1.0)
+    if (!leaving)
     {
-        finish_morph();
+        return;
     }
+
+    auto output = leaving->get_output();
+    if (!output && revealed)
+    {
+        output = revealed->get_output();
+    }
+
+    if (!output)
+    {
+        return;
+    }
+
+    anim_slot_t v;
+    v.view = leaving;
+    transform_for_rect(leaving, grouped_geom, v.sx0, v.sy0, v.tx0, v.ty0);
+    v.a0 = ungroup_start_alpha; v.a1 = 1.0;   /* sharpen from soft */
+    v.spring = true;
+
+    anim_slot_t r;
+    if (revealed && (revealed != leaving))
+    {
+        r.view = revealed;
+        r.sx0 = reveal_pop_scale; r.sy0 = reveal_pop_scale;
+        r.sx1 = 1.0; r.sy1 = 1.0;
+        r.a0 = 0.0; r.a1 = 1.0;
+        r.spring = true;
+    }
+
+    morph.old_slot = r;   /* may be an empty slot (no reveal) */
+    morph.new_slot = v;
+    begin_morph(output, ungroup_anim_ms, ungroup_spring_k);
 }
 
 /* --------------------------- group drag ---------------------------- *
@@ -1082,16 +1319,16 @@ void do_group_windows(wl_client*, struct wl_resource*, uint32_t parent_id, uint3
         wf::scene::set_node_enabled(parent->get_root_node(), true);
     }
 
-    while (child->get_root_node()->is_enabled())
-    {
-        wf::scene::set_node_enabled(child->get_root_node(), false);
-    }
-
+    /* Record where each window should return to on ungroup. The child stays
+     * enabled for now: start_group_anim animates it imploding into the parent
+     * and only stacks (move) + hides it once the animation completes. */
     auto cg = wf::toplevel_cast(child)->get_geometry();
     child_data->decoration->ungroup_restore_position = {cg.x, cg.y};
     auto vg = wf::toplevel_cast(parent)->get_geometry();
     parent_data->decoration->ungroup_restore_position = {vg.x, vg.y};
-    wf::toplevel_cast(child)->move(vg.x, vg.y);
+
+    group_visible[parent_data->decoration->group_id] = parent->get_id();
+    start_group_anim(child, parent, vg);
 }
 
 void do_select_window(wl_client*, struct wl_resource*, uint32_t select_id)
@@ -1217,27 +1454,13 @@ void ungroup_window(wl_client*, struct wl_resource*, uint32_t id, bool closing)
     /* Ungrouping (also called on view destruction) invalidates any in-flight
      * morph involving this view. */
     if (morph.active &&
-        ((morph.old_view && (morph.old_view->get_id() == id)) ||
-         (morph.new_view && (morph.new_view->get_id() == id))))
+        ((morph.old_slot.view && (morph.old_slot.view->get_id() == id)) ||
+         (morph.new_slot.view && (morph.new_slot.view->get_id() == id))))
     {
         finish_morph();
     }
 
-    wayfire_view view = nullptr;
-    for (auto& v : wf::get_core().get_all_views())
-    {
-        if (v->role != wf::VIEW_ROLE_TOPLEVEL)
-        {
-            continue;
-        }
-
-        if (v->get_id() == id)
-        {
-            view = v;
-            break;
-        }
-    }
-
+    wayfire_view view = find_view_by_id(id);
     if (!view)
     {
         return;
@@ -1261,6 +1484,10 @@ void ungroup_window(wl_client*, struct wl_resource*, uint32_t id, bool closing)
         return;
     }
 
+    /* Geometry the view occupied while stacked in the group — the animation
+     * bursts out from here to the restore position. Captured before the move. */
+    auto grouped_geom = wf::toplevel_cast(view)->get_geometry();
+
     if (!closing)
     {
         wf::toplevel_cast(view)->move(rg.x, rg.y);
@@ -1271,6 +1498,9 @@ void ungroup_window(wl_client*, struct wl_resource*, uint32_t id, bool closing)
         wf::scene::set_node_enabled(view->get_root_node(), true);
     }
 
+    /* Scan the rest of the (old) group: is any member already visible, and if
+     * not, which hidden member (most recently focused) should be revealed? */
+    bool any_visible = false;
     wayfire_view unhide_me = nullptr;
     auto last_group_focused_timestamp = 0;
     for (auto& v : wf::get_core().get_all_views())
@@ -1281,30 +1511,34 @@ void ungroup_window(wl_client*, struct wl_resource*, uint32_t id, bool closing)
         }
 
         auto data = wf::toplevel_cast(v)->toplevel()->get_data<gtk4_toplevel_custom_data>();
-        if (data)
+        if (data && (data->decoration->group_id == group_id))
         {
-            if (data->decoration->group_id == group_id)
+            if (v->get_root_node()->is_enabled())
             {
-                if (v->get_root_node()->is_enabled())
-                {
-                    return;
-                }
-
-                if (wf::get_focus_timestamp(v) > last_group_focused_timestamp)
-                {
-                    last_group_focused_timestamp = wf::get_focus_timestamp(v);
-                    unhide_me = v;
-                }
+                any_visible = true;
+            } else if (wf::get_focus_timestamp(v) > last_group_focused_timestamp)
+            {
+                last_group_focused_timestamp = wf::get_focus_timestamp(v);
+                unhide_me = v;
             }
         }
     }
 
-    if (unhide_me)
+    wayfire_view revealed = nullptr;
+    if (!any_visible && unhide_me)
     {
         while (!unhide_me->get_root_node()->is_enabled())
         {
             wf::scene::set_node_enabled(unhide_me->get_root_node(), true);
         }
+
+        revealed = unhide_me;
+    }
+
+    /* Destroyed views can't be animated; only play the burst on a live ungroup. */
+    if (!closing)
+    {
+        start_ungroup_anim(view, grouped_geom, revealed);
     }
 }
 
